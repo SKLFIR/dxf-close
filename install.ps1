@@ -95,8 +95,12 @@ function Get-PythonCandidates {
 function Find-Python {
     $withoutTk = $null
 
-    # py launcher и PATH
+    # явно указанный путь имеет приоритет:
+    #   $env:DXFCLOSE_PYTHON = 'C:\...\python.exe'
     $probes = @()
+    if ($env:DXFCLOSE_PYTHON) { $probes += ,@($env:DXFCLOSE_PYTHON, $false) }
+
+    # py launcher и PATH
     $launcher = Get-Command 'py' -ErrorAction SilentlyContinue
     if ($launcher) { $probes += ,@($launcher.Source, $true) }
     foreach ($name in @('python3', 'python')) {
