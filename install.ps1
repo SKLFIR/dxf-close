@@ -22,8 +22,10 @@ function Refresh-Path {
 # Версию и tkinter проверяем ПОРОЗНЬ. Если требовать их разом, Python без tcl/tk
 # выглядит как отсутствующий, и установщик уходит ставить второй Python вместо того,
 # чтобы сказать, чего именно не хватает.
-$ProbeVersion = 'import sys; print(sys.executable if sys.version_info[:2] >= (3, 9) else "")'
-$ProbeTk      = 'import tkinter; print("tk")'
+# Внутри проб НЕ должно быть двойных кавычек: PowerShell 5.1 портит их при
+# передаче аргумента во внешний exe, и Python получает битый код.
+$ProbeVersion = 'import sys; print(sys.version_info[0]*100+sys.version_info[1]); print(sys.executable)'
+$ProbeTk      = 'import tkinter; print(1)'
 
 $script:Checked = @()
 
@@ -40,13 +42,23 @@ function Test-PythonExe($exe, $launcher = $false) {
     try {
         if ($launcher) { $out = & $exe '-3' '-c' $ProbeVersion 2>$null }
         else           { $out = & $exe '-c' $ProbeVersion 2>$null }
-        $real = Last-Line $out
-        if (-not $real -or -not (Test-Path $real)) {
-            $script:Checked += "$exe — не Python 3.9+"
+        $lines = @(@($out) | Where-Object { $_ -and "$_".Trim() } | ForEach-Object { "$_".Trim() })
+        if ($lines.Count -lt 2) {
+            $script:Checked += "$exe — не отвечает как Python"
             return $null
         }
+        if ($lines[0] -notmatch '^\d+$') {
+            $script:Checked += "$exe — не отвечает как Python"
+            return $null
+        }
+        if ([int]$lines[0] -lt 309) {
+            $script:Checked += "$exe — версия ниже 3.9"
+            return $null
+        }
+        $real = $lines[1]
+        if (-not (Test-Path $real)) { $real = $exe }
         $tk = & $real '-c' $ProbeTk 2>$null
-        $hasTk = ((Last-Line $tk) -eq 'tk')
+        $hasTk = ((Last-Line $tk) -eq '1')
         if (-not $hasTk) { $script:Checked += "$real — есть, но без модуля tkinter" }
         return [pscustomobject]@{ Path = $real; Tk = $hasTk }
     } catch {
@@ -153,16 +165,11 @@ if (-not $python) {
     Say 'Python не найден, ставлю…' Yellow
     $ok = $false
 
-    # Python Install Manager (новый официальный способ): сам py и ставит версии
-    $launcher = Get-Command 'py' -ErrorAction SilentlyContinue
-    if ($launcher) {
-        Say 'Нашёл менеджер py, прошу его поставить Python 3.12…'
-        & $launcher.Source 'install' '3.12' 2>&1 | Out-Host
-        Refresh-Path
-        if (Find-Python) { $ok = $true }
+    if ($env:DXFCLOSE_PYTHON) {
+        Say "Указанный путь не подошёл: $env:DXFCLOSE_PYTHON" Yellow
     }
 
-    if (-not $ok -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
         # --source winget обязателен: иначе при недоступном msstore winget
         # считает пакет неоднозначным и молча ничего не ставит
         winget install -e --id Python.Python.3.12 --source winget --scope user `
