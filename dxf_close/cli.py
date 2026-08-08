@@ -21,6 +21,11 @@ def main(argv=None):
                     help="без окна: только отчёт, ничего не записывать")
     ap.add_argument("--install-shortcut", action="store_true",
                     help="создать ярлык на рабочем столе")
+    ap.add_argument("--hatch-layer", action="append", metavar="СЛОЙ", default=None,
+                    help="считать слой штриховкой (можно указать несколько раз); "
+                         "без этого флага штриховка определяется сама")
+    ap.add_argument("--no-hatch", action="store_true",
+                    help="не переносить штриховку в результат — только контуры")
     args = ap.parse_args(argv)
 
     if args.install_shortcut:
@@ -31,12 +36,21 @@ def main(argv=None):
     if args.save or args.check:
         if not args.dxf:
             ap.error("нужен путь к DXF")
-        doc, segs, skipped = core.read_dxf(args.dxf)
-        res = core.build(segs, args.radius)
-        print(core.report(res, skipped))
+        dwg = core.read_dxf(args.dxf)
+        hatch_layers = set(args.hatch_layer) if args.hatch_layer else None
+        for name, rec in sorted(dwg.layers.items()):
+            print("слой %-20s отрезков %6d, сам по себе %5.1f%%%s"
+                  % (name, rec["total"], 100 * rec["share"],
+                     "  → штриховка" if name in (hatch_layers if hatch_layers is not None
+                                                 else dwg.hatch_layers) else ""))
+        res = core.process(dwg, args.radius, hatch_layers)
+        if args.no_hatch:
+            res.hatch = []
+            res.stats["hatch_lines"] = 0
+        print(core.report(res, dwg.skipped))
         if args.save:
             out = args.out or core.default_out_path(args.dxf)
-            core.save_dxf(res, doc, out)
+            core.save_dxf(res, dwg.doc, out)
             print("сохранено:", out)
         return 0
 

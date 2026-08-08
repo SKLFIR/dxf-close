@@ -9,12 +9,17 @@ from collections import Counter, defaultdict
 
 import ezdxf
 from ezdxf import path as ezpath
+from ezdxf.render import hatching
 
 SAG = 0.01          # мм: точность спрямления дуг/сплайнов в отрезки
 SNAP = 6            # знаков после запятой при поиске точно совпадающих концов
 COLLINEAR = 0.001   # мм: допуск слияния точек, лежащих на одной прямой
 
-SKIP_TYPES = ("TEXT", "MTEXT", "DIMENSION", "HATCH", "POINT", "ATTDEF", "ATTRIB",
+# слой считаем штриховкой, если почти все его отрезки висят сами по себе
+HATCH_ISOLATED_SHARE = 0.7
+HATCH_MIN_SEGMENTS = 20
+
+SKIP_TYPES = ("TEXT", "MTEXT", "DIMENSION", "POINT", "ATTDEF", "ATTRIB",
               "LEADER", "MLEADER", "IMAGE", "WIPEOUT", "SOLID", "3DFACE")
 
 
@@ -69,9 +74,39 @@ class Grid:
 
 
 # ---------------------------------------------------------------- чтение DXF
+def explode_hatch(entity):
+    """HATCH → отрезки узора. Для сплошной заливки узора нет, берём границы."""
+    layer = entity.dxf.layer if entity.dxf.hasattr("layer") else "0"
+    out = []
+    try:
+        for a, b in hatching.hatch_entity(entity):
+            p, q = (a.x, a.y), (b.x, b.y)
+            if dist(p, q) > 1e-9:
+                out.append((p, q, layer))
+    except Exception:
+        pass
+    if out:
+        return out
+    # сплошная или градиентная заливка: узора нет, оставляем очертание пятна
+    try:
+        for p in ezpath.from_hatch(entity):
+            pts = [(v.x, v.y) for v in p.flattening(SAG)]
+            for i in range(len(pts) - 1):
+                if dist(pts[i], pts[i + 1]) > 1e-12:
+                    out.append((pts[i], pts[i + 1], layer))
+    except Exception:
+        pass
+    return out
+
+
 def collect_segments(doc):
-    """Вся геометрия модели → список отрезков (p0, p1, слой). Дуги спрямляются."""
+    """Геометрия модели → отрезки (p0, p1, слой) отдельно для контуров и штриховки.
+
+    HATCH сразу раскладывается в линии узора: станок штриховку как сущность
+    не понимает, а сшивать её с контуром нельзя — это несвязанные штрихи.
+    """
     segs = []
+    hatch = []
     skipped = Counter()
 
     def walk(container):
@@ -81,6 +116,13 @@ def collect_segments(doc):
                 try:
                     walk(e.virtual_entities())
                 except Exception:
+                    skipped[t] += 1
+                continue
+            if t in ("HATCH", "MPOLYGON"):
+                lines = explode_hatch(e)
+                if lines:
+                    hatch.extend(lines)
+                else:
                     skipped[t] += 1
                 continue
             if t in SKIP_TYPES:
@@ -97,13 +139,59 @@ def collect_segments(doc):
                     segs.append((pts[i], pts[i + 1], layer))
 
     walk(doc.modelspace())
-    return segs, skipped
+    return segs, hatch, skipped
+
+
+def layer_stats(segs):
+    """По каждому слою: сколько отрезков и сколько из них висят сами по себе.
+
+    Штрих штриховки не касается концами ничего, у контура таких почти нет —
+    по этой доле разложенную ранее штриховку и отличаем от контура.
+    """
+    deg = Counter()
+    for a, b, _ in segs:
+        deg[(round(a[0], SNAP), round(a[1], SNAP))] += 1
+        deg[(round(b[0], SNAP), round(b[1], SNAP))] += 1
+    stats = {}
+    for a, b, layer in segs:
+        rec = stats.setdefault(layer, {"total": 0, "isolated": 0})
+        rec["total"] += 1
+        if deg[(round(a[0], SNAP), round(a[1], SNAP))] == 1 and \
+           deg[(round(b[0], SNAP), round(b[1], SNAP))] == 1:
+            rec["isolated"] += 1
+    for rec in stats.values():
+        rec["share"] = rec["isolated"] / rec["total"] if rec["total"] else 0.0
+        rec["hatch_like"] = (rec["total"] >= HATCH_MIN_SEGMENTS and
+                             rec["share"] >= HATCH_ISOLATED_SHARE)
+    return stats
+
+
+class Drawing:
+    """Прочитанный файл: контурная геометрия отдельно, штриховка отдельно."""
+
+    def __init__(self, path, doc, segs, hatch, skipped):
+        self.path = path
+        self.doc = doc
+        self.raw_segs = segs
+        self.hatch_from_entities = hatch
+        self.skipped = skipped
+        self.layers = layer_stats(segs)
+        # слои, которые по виду являются уже разложенной штриховкой
+        self.hatch_layers = {name for name, rec in self.layers.items() if rec["hatch_like"]}
+
+    def split(self, hatch_layers=None):
+        """Возвращает (контурные отрезки, линии штриховки) для заданного набора слоёв."""
+        marked = self.hatch_layers if hatch_layers is None else set(hatch_layers)
+        contour = [s for s in self.raw_segs if s[2] not in marked]
+        hatch = list(self.hatch_from_entities)
+        hatch += [s for s in self.raw_segs if s[2] in marked]
+        return contour, hatch
 
 
 def read_dxf(path):
     doc = ezdxf.readfile(path)
-    segs, skipped = collect_segments(doc)
-    return doc, segs, skipped
+    segs, hatch, skipped = collect_segments(doc)
+    return Drawing(path, doc, segs, hatch, skipped)
 
 
 # ---------------------------------------------------------------- сшивка
@@ -112,6 +200,7 @@ class Result:
         self.contours = []      # (точки, closed, слой)
         self.bridges = []       # (p0, p1) — отрезки, добавленные при сшивке
         self.open_ends = []     # точки, оставшиеся висячими
+        self.hatch = []         # (p0, p1, слой) — линии штриховки, как есть
         self.stats = {}
 
 
@@ -332,6 +421,18 @@ def build(segs, tol, collinear=COLLINEAR):
     return res
 
 
+def process(drawing, tol, hatch_layers=None, collinear=COLLINEAR):
+    """Полный проход: сначала контуры собираются и замыкаются, затем к результату
+    добавляется штриховка — уже в виде обычных линий, в сшивке не участвует."""
+    contour, hatch = drawing.split(hatch_layers)
+    res = build(contour, tol, collinear)
+    res.hatch = hatch
+    res.stats["hatch_lines"] = len(hatch)
+    res.stats["hatch_from_entities"] = len(drawing.hatch_from_entities)
+    res.stats["hatch_length"] = sum(dist(s[0], s[1]) for s in hatch)
+    return res
+
+
 # ---------------------------------------------------------------- запись
 def save_dxf(res, src_doc, out_path):
     doc = ezdxf.new(dxfversion=src_doc.dxfversion, setup=False)
@@ -352,6 +453,13 @@ def save_dxf(res, src_doc, out_path):
             continue
         pl = msp.add_lwpolyline(xy, format="xy", dxfattribs={"layer": layer})
         pl.closed = closed
+    for p, q, layer in res.hatch:
+        if layer not in doc.layers:
+            try:
+                doc.layers.add(name=layer)
+            except Exception:
+                layer = "0"
+        msp.add_line(p, q, dxfattribs={"layer": layer})
     doc.saveas(out_path)
     return out_path
 
@@ -368,8 +476,13 @@ def report(res, skipped=None):
         "висячих концов: было %d → осталось %d" % (s.get("loose_before", 0), s.get("loose_after", 0)),
         "контуров: %d — замкнутых %d, открытых %d" % (s.get("contours", 0), s.get("closed", 0), s.get("open", 0)),
         "вершин: %d → %d" % (s.get("pts_before", 0), s.get("pts_after", 0)),
-        "общая длина реза: %.2f мм" % s.get("perimeter", 0.0),
+        "длина реза по контурам: %.2f мм" % s.get("perimeter", 0.0),
     ]
+    if s.get("hatch_lines"):
+        src = s.get("hatch_from_entities", 0)
+        lines.append("штриховка: %d линий (%.2f мм)%s" % (
+            s["hatch_lines"], s.get("hatch_length", 0.0),
+            ", из них %d разложено из HATCH" % src if src else ""))
     if skipped:
         lines.append("пропущено (не геометрия): %s" % dict(skipped))
     return "\n".join(lines)

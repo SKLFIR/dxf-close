@@ -20,8 +20,7 @@ def run(dxf_path=None, tol0=0.1):
     root.geometry("1200x900")
     _set_window_icon(root)
 
-    state = {"path": None, "doc": None, "segs": None, "skipped": None,
-             "res": None, "focus": 0}
+    state = {"dwg": None, "res": None, "focus": 0, "layer_vars": {}}
 
     # ------------------------------------------------------------ панель
     top = tk.Frame(root, padx=8, pady=6)
@@ -50,10 +49,32 @@ def run(dxf_path=None, tol0=0.1):
 
     show_bridges = tk.BooleanVar(value=True)
     show_open = tk.BooleanVar(value=True)
+    keep_hatch = tk.BooleanVar(value=True)
     tk.Checkbutton(top, text="мостики", variable=show_bridges,
                    command=lambda: redraw(True)).pack(side="left", padx=(12, 0))
     tk.Checkbutton(top, text="висячие концы", variable=show_open,
                    command=lambda: redraw(True)).pack(side="left")
+    tk.Checkbutton(top, text="штриховку в результат", variable=keep_hatch,
+                   command=lambda: recompute()).pack(side="left")
+
+    # ------------------------------------------------------------ слои
+    layers_bar = tk.Frame(root, padx=8, pady=2)
+    layers_bar.pack(fill="x")
+
+    def rebuild_layers_bar():
+        for w in layers_bar.winfo_children():
+            w.destroy()
+        state["layer_vars"] = {}
+        dwg = state["dwg"]
+        if not dwg:
+            return
+        tk.Label(layers_bar, text="Штриховка на слоях:", fg="#444").pack(side="left")
+        for name, rec in sorted(dwg.layers.items(), key=lambda kv: -kv[1]["total"]):
+            var = tk.BooleanVar(value=name in dwg.hatch_layers)
+            state["layer_vars"][name] = var
+            tk.Checkbutton(layers_bar, variable=var, command=lambda: recompute(),
+                           text="%s (%d, сам по себе %.0f%%)"
+                                % (name, rec["total"], 100 * rec["share"])).pack(side="left")
 
     status = tk.Label(root, text="Откройте DXF-файл.", justify="left", anchor="w",
                       font=("Menlo" if sys.platform == "darwin" else "Consolas", 11),
@@ -130,10 +151,12 @@ def run(dxf_path=None, tol0=0.1):
 
     def fit_view():
         res = state["res"]
-        if not res or not res.contours:
+        if not res or (not res.contours and not res.hatch):
             return
-        xs = [p[0] for xy, _, _ in res.contours for p in xy]
-        ys = [p[1] for xy, _, _ in res.contours for p in xy]
+        xs = [p[0] for xy, _, _ in res.contours for p in xy] + \
+             [v[0] for p, q, _ in res.hatch for v in (p, q)]
+        ys = [p[1] for xy, _, _ in res.contours for p in xy] + \
+             [v[1] for p, q, _ in res.hatch for v in (p, q)]
         m = max(max(xs) - min(xs), max(ys) - min(ys)) * 0.03 + 1
         ax.set_xlim(min(xs) - m, max(xs) + m)
         ax.set_ylim(min(ys) - m, max(ys) + m)
@@ -171,6 +194,9 @@ def run(dxf_path=None, tol0=0.1):
         if not res:
             canvas.draw_idle()
             return
+        if res.hatch:
+            ax.add_collection(LineCollection([(p, q) for p, q, _ in res.hatch],
+                                             colors="#b9c2cc", linewidths=0.4))
         ok, bad = [], []
         for xy, closed, _ in res.contours:
             n = len(xy)
@@ -190,9 +216,12 @@ def run(dxf_path=None, tol0=0.1):
             ax.plot([p[0] for p in res.open_ends], [p[1] for p in res.open_ends],
                     "o", color="#d62728", ms=9, mfc="none", mew=1.6)
         s = res.stats
-        ax.set_title("замкнутых %d · открытых %d · мостиков %d · висячих концов %d"
-                     % (s.get("closed", 0), s.get("open", 0),
-                        s.get("bridges", 0), s.get("loose_after", 0)))
+        title = ("замкнутых %d · открытых %d · мостиков %d · висячих концов %d"
+                 % (s.get("closed", 0), s.get("open", 0),
+                    s.get("bridges", 0), s.get("loose_after", 0)))
+        if s.get("hatch_lines"):
+            title += " · штриховка %d линий" % s["hatch_lines"]
+        ax.set_title(title)
         if keep_view:
             ax.set_xlim(xl)
             ax.set_ylim(yl)
@@ -201,7 +230,8 @@ def run(dxf_path=None, tol0=0.1):
             fit_view()
 
     def recompute(keep_view=True):
-        if state["segs"] is None:
+        dwg = state["dwg"]
+        if dwg is None:
             return
         try:
             tol = float(tol_var.get().replace(",", "."))
@@ -210,48 +240,54 @@ def run(dxf_path=None, tol0=0.1):
             return
         status.config(text="считаю…")
         root.update_idletasks()
-        state["res"] = core.build(state["segs"], tol)
+        marked = {name for name, var in state["layer_vars"].items() if var.get()}
+        res = core.process(dwg, tol, marked)
+        if not keep_hatch.get():
+            res.hatch = []
+            res.stats["hatch_lines"] = 0
+        state["res"] = res
         state["focus"] = 0
-        status.config(text=core.report(state["res"], state["skipped"]))
+        status.config(text=core.report(res, dwg.skipped))
         redraw(keep_view=keep_view)
 
     def load(path):
         status.config(text="читаю %s…" % os.path.basename(path))
         root.update_idletasks()
         try:
-            doc, segs, skipped = core.read_dxf(path)
+            dwg = core.read_dxf(path)
         except Exception as exc:
             messagebox.showerror("Не читается", "%s\n\n%s" % (path, exc))
             status.config(text="не удалось открыть файл")
             return
-        if not segs:
+        if not dwg.raw_segs and not dwg.hatch_from_entities:
             messagebox.showwarning("Пусто", "В файле не нашлось линейной геометрии.")
             return
-        state.update(path=path, doc=doc, segs=segs, skipped=skipped)
+        state["dwg"] = dwg
+        rebuild_layers_bar()
         root.title("Замыкание контуров DXF — %s" % os.path.basename(path))
         recompute(keep_view=False)
 
     def open_file():
-        start = os.path.dirname(state["path"]) if state["path"] else os.path.expanduser("~")
+        start = os.path.dirname(state["dwg"].path) if state["dwg"] else os.path.expanduser("~")
         p = filedialog.askopenfilename(title="Выберите DXF", initialdir=start,
                                        filetypes=[("DXF", "*.dxf"), ("Все файлы", "*.*")])
         if p:
             load(p)
 
     def save_file():
-        res = state["res"]
+        res, dwg = state["res"], state["dwg"]
         if not res:
             messagebox.showinfo("Нечего сохранять", "Сначала откройте DXF.")
             return
-        base = os.path.basename(core.default_out_path(state["path"]))
+        base = os.path.basename(core.default_out_path(dwg.path))
         p = filedialog.asksaveasfilename(title="Сохранить как", defaultextension=".dxf",
                                          initialfile=base,
-                                         initialdir=os.path.dirname(state["path"]),
+                                         initialdir=os.path.dirname(dwg.path),
                                          filetypes=[("DXF", "*.dxf")])
         if not p:
             return
         try:
-            core.save_dxf(res, state["doc"], p)
+            core.save_dxf(res, dwg.doc, p)
         except Exception as exc:
             messagebox.showerror("Не сохранилось", str(exc))
             return
