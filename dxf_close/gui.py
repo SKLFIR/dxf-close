@@ -46,6 +46,7 @@ def run(dxf_path=None, tol0=0.1):
     tk.Button(top, text="Открыть DXF…", command=lambda: open_file()).pack(side="left", padx=6)
     tk.Button(top, text="Сохранить DXF…", command=lambda: save_file()).pack(side="left")
     tk.Button(top, text="К проблеме →", command=lambda: goto_problem()).pack(side="left", padx=6)
+    tk.Button(top, text="Вписать", command=lambda: fit_view()).pack(side="left")
 
     show_bridges = tk.BooleanVar(value=True)
     show_open = tk.BooleanVar(value=True)
@@ -62,8 +63,8 @@ def run(dxf_path=None, tol0=0.1):
     # ------------------------------------------------------------ холст
     # нижние панели пакуются первыми, иначе холст вытесняет их за край окна
     tk.Label(root, fg="#666", anchor="w", padx=8, pady=2,
-             text="колесо мыши — зум к курсору · зажатая левая кнопка — панорама · "
-                  "двойной клик — вся картинка · Enter — пересчитать").pack(side="bottom", fill="x")
+             text="колесо мыши — зум к курсору · перетаскивание — панорама · "
+                  "двойной клик — вписать целиком · Enter — пересчитать").pack(side="bottom", fill="x")
 
     fig = Figure(figsize=(9, 8), dpi=100)
     ax = fig.add_subplot(111)
@@ -76,10 +77,14 @@ def run(dxf_path=None, tol0=0.1):
 
     canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
 
+    def toolbar_busy():
+        """Включён режим «Лупа»/«Рука» в панели — не мешаем ей, иначе вид едет дважды."""
+        return bool(getattr(canvas.toolbar, "mode", ""))
+
     def on_scroll(event):
         if event.inaxes is not ax or event.xdata is None:
             return
-        f = 1 / 1.25 if event.button == "up" else 1.25
+        f = 1 / 1.15 if event.button == "up" else 1.15
         x0, x1 = ax.get_xlim()
         y0, y1 = ax.get_ylim()
         cx, cy = event.xdata, event.ydata
@@ -87,20 +92,28 @@ def run(dxf_path=None, tol0=0.1):
         ax.set_ylim(cy + (y0 - cy) * f, cy + (y1 - cy) * f)
         canvas.draw_idle()
 
-    pan = {"anchor": None}
+    pan = {"anchor": None, "active": False}
+    PAN_THRESHOLD = 4      # пикселей: пока не сдвинулись дальше, вид стоит на месте
 
     def on_press(event):
-        if event.inaxes is not ax or event.button != 1:
+        if event.inaxes is not ax or toolbar_busy():
             return
         if event.dblclick:
             fit_view()
             return
-        pan["anchor"] = (event.xdata, event.ydata, ax.get_xlim(), ax.get_ylim())
+        pan["anchor"] = (event.xdata, event.ydata, event.x, event.y,
+                         ax.get_xlim(), ax.get_ylim())
+        pan["active"] = False
 
     def on_motion(event):
         if pan["anchor"] is None or event.inaxes is not ax or event.xdata is None:
             return
-        x0, y0, xl, yl = pan["anchor"]
+        x0, y0, px, py, xl, yl = pan["anchor"]
+        # короткий клик не должен таскать чертёж — двигаем только после порога
+        if not pan["active"]:
+            if abs(event.x - px) < PAN_THRESHOLD and abs(event.y - py) < PAN_THRESHOLD:
+                return
+            pan["active"] = True
         dx, dy = x0 - event.xdata, y0 - event.ydata
         ax.set_xlim(xl[0] + dx, xl[1] + dx)
         ax.set_ylim(yl[0] + dy, yl[1] + dy)
@@ -108,6 +121,7 @@ def run(dxf_path=None, tol0=0.1):
 
     def on_release(_event):
         pan["anchor"] = None
+        pan["active"] = False
 
     canvas.mpl_connect("scroll_event", on_scroll)
     canvas.mpl_connect("button_press_event", on_press)
