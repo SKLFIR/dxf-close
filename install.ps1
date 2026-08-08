@@ -19,51 +19,104 @@ function Refresh-Path {
     $env:Path = ($machine, $user | Where-Object { $_ }) -join ';'
 }
 
-$Probe = 'import sys, tkinter; print(sys.executable if sys.version_info[:2] >= (3, 9) else "")'
+# Версию и tkinter проверяем ПОРОЗНЬ. Если требовать их разом, Python без tcl/tk
+# выглядит как отсутствующий, и установщик уходит ставить второй Python вместо того,
+# чтобы сказать, чего именно не хватает.
+$ProbeVersion = 'import sys; print(sys.executable if sys.version_info[:2] >= (3, 9) else "")'
+$ProbeTk      = 'import tkinter; print("tk")'
 
-function Test-PythonExe($exe) {
+$script:Checked = @()
+
+function Last-Line($value) {
+    # вывод команды может прийти массивом строк — берём последнюю непустую
+    if ($null -eq $value) { return '' }
+    $line = @($value) | Where-Object { $_ -and "$_".Trim() } | Select-Object -Last 1
+    if ($null -eq $line) { return '' }
+    return "$line".Trim()
+}
+
+function Test-PythonExe($exe, $launcher = $false) {
+    if (-not $exe) { return $null }
     try {
-        $out = & $exe '-c' $Probe 2>$null
-        if ($out -and $out.Trim()) { return $out.Trim() }
-    } catch { }
+        if ($launcher) { $out = & $exe '-3' '-c' $ProbeVersion 2>$null }
+        else           { $out = & $exe '-c' $ProbeVersion 2>$null }
+        $real = Last-Line $out
+        if (-not $real -or -not (Test-Path $real)) {
+            $script:Checked += "$exe — не Python 3.9+"
+            return $null
+        }
+        $tk = & $real '-c' $ProbeTk 2>$null
+        $hasTk = ((Last-Line $tk) -eq 'tk')
+        if (-not $hasTk) { $script:Checked += "$real — есть, но без модуля tkinter" }
+        return [pscustomobject]@{ Path = $real; Tk = $hasTk }
+    } catch {
+        $script:Checked += "$exe — запустить не удалось"
+    }
     return $null
 }
 
-function Test-PythonLauncher($exe) {
-    try {
-        $out = & $exe '-3' '-c' $Probe 2>$null
-        if ($out -and $out.Trim()) { return $out.Trim() }
-    } catch { }
-    return $null
+function Get-PythonCandidates {
+    $cands = @()
+
+    # 1. реестр — самый надёжный источник: сюда пишутся и python.org, и winget
+    foreach ($root in @('HKLM:\SOFTWARE\Python\PythonCore',
+                        'HKCU:\SOFTWARE\Python\PythonCore',
+                        'HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore')) {
+        if (-not (Test-Path $root)) { continue }
+        foreach ($key in (Get-ChildItem $root -ErrorAction SilentlyContinue)) {
+            $ipKey = Join-Path $key.PSPath 'InstallPath'
+            if (-not (Test-Path $ipKey)) { continue }
+            $props = Get-ItemProperty $ipKey -ErrorAction SilentlyContinue
+            if (-not $props) { continue }
+            $exe = $props.ExecutablePath
+            if (-not $exe -and $props.'(default)') { $exe = Join-Path $props.'(default)' 'python.exe' }
+            if ($exe -and (Test-Path $exe)) { $cands += $exe }
+        }
+    }
+
+    # 2. обычные места установки; %LOCALAPPDATA%\Python — это Python Install Manager
+    $roots = @((Join-Path $env:LOCALAPPDATA 'Programs\Python'),
+               (Join-Path $env:LOCALAPPDATA 'Python'),
+               'C:\Program Files', 'C:\')
+    foreach ($root in $roots) {
+        if (-not (Test-Path $root)) { continue }
+        foreach ($dir in (Get-ChildItem $root -Directory -Filter 'Python*' -ErrorAction SilentlyContinue)) {
+            $exe = Join-Path $dir.FullName 'python.exe'
+            if (Test-Path $exe) { $cands += $exe }
+            foreach ($sub in (Get-ChildItem $dir.FullName -Directory -ErrorAction SilentlyContinue)) {
+                $exe = Join-Path $sub.FullName 'python.exe'
+                if (Test-Path $exe) { $cands += $exe }
+            }
+        }
+    }
+    return ($cands | Select-Object -Unique)
 }
 
 function Find-Python {
-    # сначала то, что в PATH
+    $withoutTk = $null
+
+    # py launcher и PATH
+    $probes = @()
     $launcher = Get-Command 'py' -ErrorAction SilentlyContinue
-    if ($launcher -and $launcher.Source -notlike '*WindowsApps*') {
-        $found = Test-PythonLauncher $launcher.Source
-        if ($found) { return $found }
-    }
+    if ($launcher) { $probes += ,@($launcher.Source, $true) }
     foreach ($name in @('python3', 'python')) {
         $exe = Get-Command $name -ErrorAction SilentlyContinue
-        if (-not $exe) { continue }
-        # заглушка из Microsoft Store — не Python, а редирект в магазин
-        if ($exe.Source -like '*WindowsApps*') { continue }
-        $found = Test-PythonExe $exe.Source
-        if ($found) { return $found }
+        # заглушка Microsoft Store живёт там же, но она просто не пройдёт проверку
+        if ($exe) { $probes += ,@($exe.Source, $false) }
     }
-    # затем обычные места установки: свежий winget/python.org мог не попасть в PATH
-    $roots = @(
-        (Join-Path $env:LOCALAPPDATA 'Programs\Python'),
-        'C:\Program Files\Python312', 'C:\Program Files\Python313', 'C:\Program Files\Python311'
-    )
-    foreach ($root in $roots) {
-        if (-not (Test-Path $root)) { continue }
-        $exes = Get-ChildItem -Path $root -Filter 'python.exe' -Recurse -Depth 2 -ErrorAction SilentlyContinue
-        foreach ($e in ($exes | Sort-Object FullName -Descending)) {
-            $found = Test-PythonExe $e.FullName
-            if ($found) { return $found }
-        }
+    foreach ($c in (Get-PythonCandidates)) { $probes += ,@($c, $false) }
+
+    foreach ($p in $probes) {
+        $res = Test-PythonExe $p[0] $p[1]
+        if (-not $res) { continue }
+        if ($res.Tk) { return $res.Path }
+        if (-not $withoutTk) { $withoutTk = $res.Path }
+    }
+
+    if ($withoutTk) {
+        Say 'Python есть, но собран без модуля tkinter — окно программы без него не откроется.' Yellow
+        Say 'Переустановите Python с python.org, отметив компонент "tcl/tk and IDLE".' Yellow
+        return $withoutTk
     }
     return $null
 }
@@ -95,7 +148,17 @@ $python = Find-Python
 if (-not $python) {
     Say 'Python не найден, ставлю…' Yellow
     $ok = $false
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
+
+    # Python Install Manager (новый официальный способ): сам py и ставит версии
+    $launcher = Get-Command 'py' -ErrorAction SilentlyContinue
+    if ($launcher) {
+        Say 'Нашёл менеджер py, прошу его поставить Python 3.12…'
+        & $launcher.Source 'install' '3.12' 2>&1 | Out-Host
+        Refresh-Path
+        if (Find-Python) { $ok = $true }
+    }
+
+    if (-not $ok -and (Get-Command winget -ErrorAction SilentlyContinue)) {
         # --source winget обязателен: иначе при недоступном msstore winget
         # считает пакет неоднозначным и молча ничего не ставит
         winget install -e --id Python.Python.3.12 --source winget --scope user `
@@ -108,11 +171,21 @@ if (-not $python) {
         catch { Say "Не удалось скачать Python: $_" Red; $ok = $false }
     }
     Refresh-Path
+    $script:Checked = @()
     $python = Find-Python
     if (-not $python) {
+        Say ''
         Say 'Python поставить не удалось.' Red
-        Say 'Поставьте вручную: https://www.python.org/downloads/'
-        Say 'Обязательно отметьте галочку "Add python.exe to PATH", затем повторите команду.'
+        if ($script:Checked.Count) {
+            Say 'Что проверялось:' DarkGray
+            foreach ($line in ($script:Checked | Select-Object -Unique)) { Say "  $line" DarkGray }
+        }
+        Say ''
+        Say 'Поставьте вручную: https://www.python.org/downloads/windows/'
+        Say 'Нужен файл вида python-3.12.10-amd64.exe — "Windows installer (64-bit)".'
+        Say 'Это .exe, а не архив с исходниками (.tar.xz / .zip — не подойдут).'
+        Say 'При установке отметьте "Add python.exe to PATH" и компонент "tcl/tk and IDLE".'
+        Say 'Затем повторите команду установки.'
         exit 1
     }
 }
